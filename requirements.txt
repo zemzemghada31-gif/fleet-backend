@@ -1,3 +1,11 @@
 fastapi
 uvicorn[standard]
 pydantic
+sqlalchemy
+aiomysql
+python-jose[cryptography]
+bcrypt
+python-multipart
+opencv-python-headless
+onnxruntime
+pytesseract
