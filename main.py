@@ -1,3 +1,4 @@
+from database import engine, Base
 import asyncio
 import math
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form, status

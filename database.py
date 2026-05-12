@@ -3,7 +3,9 @@ from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey, BigInteger, DateTime, Text, text
 from datetime import datetime
 
-DATABASE_URL = "mysql+aiomysql://lora_user:lora_pass@localhost/parking_lora"
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "mysql+aiomysql://root:qKMLsqrtIzICXyjgfjtMAMhSifIKzhLG@junction.proxy.rlwy.net:53258/railway")
 engine = create_async_engine(DATABASE_URL, echo=False, pool_size=10)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 class Base(DeclarativeBase):
