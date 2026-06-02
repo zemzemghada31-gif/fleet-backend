@@ -15,7 +15,7 @@ import onnxruntime as ort
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 CAMERA_ID = int(os.environ.get("CAMERA_ID", "0"))
-CONFIDENCE_THRESHOLD = float(os.environ.get("YOLO_CONFIDENCE", "0.4"))
+CONFIDENCE_THRESHOLD = float(os.environ.get("YOLO_CONFIDENCE", "0.25"))
 COOLDOWN_SECONDS = float(os.environ.get("YOLO_COOLDOWN", "5.0"))
 MODEL_DIR = Path(__file__).parent / "models"
 MODEL_PATH = MODEL_DIR / "yolov8n.onnx"
@@ -28,6 +28,16 @@ TESSERACT_CMD = os.environ.get(
 os.environ["TESSERACT_CMD"] = TESSERACT_CMD
 import pytesseract
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+try:
+    _langs = pytesseract.get_languages(config="")
+    print(f"[YOLO] Langues Tesseract disponibles: {_langs}")
+    if "ara" not in _langs:
+        print("[YOLO] ⚠️  Arabe non disponible. Installe le pack 'ara' avec:")
+        print("[YOLO]    sudo apt install tesseract-ocr-ara   (Linux)")
+        print("[YOLO]    ou télécharge depuis: https://github.com/tesseract-ocr/tessdata_best")
+except Exception as e:
+    print(f"[YOLO] Impossible de lister les langues Tesseract: {e}")
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -103,10 +113,12 @@ class YoloService:
         if self.camera_active:
             return True
         try:
-            self.cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
+            backends = [cv2.CAP_MSMF, cv2.CAP_ANY]
+            for backend in backends:
+                self.cap = cv2.VideoCapture(camera_id, backend)
+                if self.cap and self.cap.isOpened():
+                    break
             if not self.cap or not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(camera_id)
-            if not self.cap.isOpened():
                 self.cap = None
                 return False
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -127,6 +139,10 @@ class YoloService:
                 self.cap.release()
             except Exception:
                 pass
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
         self.cap = None
         self.camera_active = False
 
@@ -137,28 +153,41 @@ class YoloService:
         if frame is None:
             return None, None
 
-        plate_text = None
-        plate_image = None
-
-        if self.load_model():
-            plate_text, plate_image = self._yolo_detect(frame)
-
-        if plate_text is None:
-            plate_text, plate_image = self._cv_detect(frame)
-
-        return plate_text, plate_image
+        return self._detect_plate_pipeline(frame)
 
     def detect_plate_from_frame(self, frame: np.ndarray) -> tuple[Optional[str], Optional[bytes]]:
-        plate_text = None
-        plate_image = None
+        return self._detect_plate_pipeline(frame)
 
+    def _detect_plate_pipeline(self, frame: np.ndarray) -> tuple[Optional[str], Optional[bytes]]:
+        h, w = frame.shape[:2]
+        print(f"[PIPELINE] Image {w}x{h}")
+
+        # Étape 1 : Détection CV directe de la plaque (contours, couleur blanche)
+        plate_text, plate_image = self._cv_detect(frame)
+        if plate_text:
+            print(f"[PIPELINE] OK CV detect: [{plate_text}]")
+            return plate_text, plate_image
+        print("[PIPELINE] CV detect: rien")
+
+        # Étape 2 : Détection YOLO de la voiture → puis plaque dans le crop
         if self.load_model():
             plate_text, plate_image = self._yolo_detect(frame)
+            if plate_text:
+                print(f"[PIPELINE] OK YOLO: [{plate_text}]")
+                return plate_text, plate_image
+            print("[PIPELINE] YOLO: rien")
+        else:
+            print("[PIPELINE] Modele YOLO non charge")
 
-        if plate_text is None:
-            plate_text, plate_image = self._cv_detect(frame)
+        # Étape 3 : OCR sur l'image entière en dernier recours
+        plate_text = self._ocr_read(frame)
+        if plate_text:
+            print(f"[PIPELINE] OK OCR full: [{plate_text}]")
+            _, jpeg = cv2.imencode(".jpg", frame)
+            return plate_text, jpeg.tobytes()
+        print("[PIPELINE] OCR full: rien → echec")
 
-        return plate_text, plate_image
+        return None, None
 
     def _yolo_detect(self, frame: np.ndarray) -> tuple[Optional[str], Optional[bytes]]:
         if self.session is None:
@@ -206,6 +235,7 @@ class YoloService:
                 best_box = (x1, y1, x2, y2)
 
         if best_box is None:
+            print("[YOLO] Aucune voiture detectee (best_box=None)")
             return None, None
 
         x1, y1, x2, y2 = best_box
@@ -213,37 +243,173 @@ class YoloService:
         if cropped.size == 0:
             return None, None
 
+        print(f"[YOLO] Voiture detectee: box=({x1},{y1},{x2},{y2}) crop={cropped.shape} conf={best_conf:.2f}")
+
+        # Étape 1 : chercher la plaque dans le crop de la voiture (détection CV)
+        p_text, p_img = self._detect_canny_plate(cropped)
+        if not p_text:
+            p_text, p_img = self._detect_gradient_plate(cropped)
+
+        if p_text:
+            return p_text, p_img
+
+        # Fallback : OCR sur toute la voiture
         _, jpeg = cv2.imencode(".jpg", cropped)
         plate_image = jpeg.tobytes()
         plate_text = self._ocr_read(cropped)
+        if plate_text:
+            print(f"[YOLO] OCR full voiture: [{plate_text}]")
 
         return plate_text, plate_image
 
     def _cv_detect(self, frame: np.ndarray) -> tuple[Optional[str], Optional[bytes]]:
+        h, w = frame.shape[:2]
+
+        result = self._detect_canny_plate(frame)
+        if result[0]:
+            return result
+
+        result = self._detect_gradient_plate(frame)
+        if result[0]:
+            return result
+
+        result = self._detect_white_plate(frame)
+        if result[0]:
+            return result
+
+        print(f"[YOLO] Aucune plaque detectee dans l'image {w}x{h}")
+        return None, None
+
+    def _detect_canny_plate(self, frame: np.ndarray) -> tuple[Optional[str], Optional[bytes]]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        bfilter = cv2.bilateralFilter(gray, 11, 17, 17)
-        edged = cv2.Canny(bfilter, 30, 200)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        h_im, w_im = frame.shape[:2]
+        max_plate_area = h_im * w_im * 0.35
 
-        contours, _ = cv2.findContours(edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+        for low, high in [(30, 200), (50, 150), (20, 100)]:
+            bfilter = cv2.bilateralFilter(gray, 9, 17, 17)
+            edged = cv2.Canny(bfilter, low, high)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            edged = cv2.dilate(edged, kernel, iterations=1)
 
+            contours, _ = cv2.findContours(edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+            candidates = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < 300 or area > max_plate_area:
+                    continue
+                peri = cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+                x, y, bw, bh = cv2.boundingRect(approx)
+                aspect = bw / max(1, bh)
+                if aspect < 1.2 or aspect > 8.0 or bw < 40 or bh < 12:
+                    continue
+                candidates.append((area, x, y, bw, bh))
+
+            candidates.sort(key=lambda c: c[0], reverse=True)
+
+            for area, x, y, bw, bh in candidates:
+                margin_x = int(bw * 0.15)
+                margin_y = int(bh * 0.15)
+                x1 = max(0, x - margin_x)
+                y1 = max(0, y - margin_y)
+                x2 = min(frame.shape[1], x + bw + margin_x)
+                y2 = min(frame.shape[0], y + bh + margin_y)
+                cropped = frame[y1:y2, x1:x2]
+                if cropped.size == 0:
+                    continue
+                plate_text = self._ocr_read(cropped)
+                if plate_text:
+                    _, jpeg = cv2.imencode(".jpg", cropped)
+                    return plate_text, jpeg.tobytes()
+
+        return None, None
+
+    def _detect_gradient_plate(self, frame: np.ndarray) -> tuple[Optional[str], Optional[bytes]]:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        mag = cv2.magnitude(grad_x, grad_y)
+        mag = np.uint8(np.clip(mag, 0, 255))
+
+        _, thresh = cv2.threshold(mag, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 5))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        closed = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        h_im, w_im = frame.shape[:2]
+        max_plate_area = h_im * w_im * 0.35
+
+        candidates = []
         for cnt in contours:
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-            x, y, bw, bh = cv2.boundingRect(approx)
+            area = cv2.contourArea(cnt)
+            if area < 500 or area > max_plate_area:
+                continue
+            x, y, bw, bh = cv2.boundingRect(cnt)
             aspect = bw / max(1, bh)
             if aspect < 1.5 or aspect > 6.0 or bw < 50 or bh < 15:
                 continue
+            candidates.append((area, x, y, bw, bh))
 
-            cropped = frame[y:y + bh, x:x + bw]
+        candidates.sort(key=lambda c: c[0], reverse=True)
+
+        for area, x, y, bw, bh in candidates:
+            x1 = max(0, x - 5)
+            y1 = max(0, y - 5)
+            x2 = min(frame.shape[1], x + bw + 5)
+            y2 = min(frame.shape[0], y + bh + 5)
+            cropped = frame[y1:y2, x1:x2]
             if cropped.size == 0:
                 continue
-
-            _, jpeg = cv2.imencode(".jpg", cropped)
-            plate_image = jpeg.tobytes()
             plate_text = self._ocr_read(cropped)
+            if plate_text:
+                _, jpeg = cv2.imencode(".jpg", cropped)
+                return plate_text, jpeg.tobytes()
 
-            return plate_text, plate_image
+        return None, None
+
+    def _detect_white_plate(self, frame: np.ndarray) -> tuple[Optional[str], Optional[bytes]]:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower_white = np.array([0, 0, 168])
+        upper_white = np.array([180, 40, 255])
+        mask = cv2.inRange(hsv, lower_white, upper_white)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_area = 0
+        best_box = None
+        for cnt in contours:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            area = bw * bh
+            aspect = bw / max(1, bh)
+            if area < 800 or aspect < 1.5 or aspect > 7.0 or bw < 60 or bh < 20:
+                continue
+            if area > best_area:
+                best_area = area
+                best_box = (x, y, bw, bh)
+
+        if best_box:
+            x, y, bw, bh = best_box
+            margin = 10
+            x1 = max(0, x - margin)
+            y1 = max(0, y - margin)
+            x2 = min(frame.shape[1], x + bw + margin)
+            y2 = min(frame.shape[0], y + bh + margin)
+            cropped = frame[y1:y2, x1:x2]
+            plate_text = self._ocr_read(cropped)
+            if plate_text:
+                _, jpeg = cv2.imencode(".jpg", cropped)
+                return plate_text, jpeg.tobytes()
 
         return None, None
 
@@ -266,59 +432,113 @@ class YoloService:
         text = self._contour_ocr(cropped)
         return text
 
+    def _preprocess_plate(self, gray: np.ndarray, fx: int = 3) -> list:
+        h, w = gray.shape
+        # Redimensionner fortement pour Tesseract
+        big = cv2.resize(gray, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
+
+        # Débruitage léger (conserve les bords)
+        denoised = cv2.fastNlMeansDenoising(big, h=10)
+
+        # Sharpen (renforce les caractères)
+        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        sharpened = cv2.filter2D(denoised, -1, kernel)
+
+        variants = [
+            ("raw", big),
+            ("sharp", sharpened),
+            ("clahe", cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(big)),
+        ]
+
+        # Seuillage uniquement si le contraste est bon
+        mean_val = np.mean(big)
+        if mean_val > 40 and mean_val < 210:
+            _, otsu = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            variants.append(("otsu", otsu))
+            _, otsu_inv = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            variants.append(("otsu_inv", otsu_inv))
+
+        return variants
+
     def _tesseract_ocr(self, cropped: np.ndarray) -> Optional[str]:
         try:
             gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            config = "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
-            text = pytesseract.image_to_string(thresh, config=config)
-            cleaned = self._clean_plate(text)
-            if cleaned:
-                return cleaned
-            config2 = "--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
-            text2 = pytesseract.image_to_string(thresh, config=config2)
-            return self._clean_plate(text2)
-        except Exception:
+            variants = self._preprocess_plate(gray)
+
+            # Configs organisées : PSM 3 (auto) en premier, puis spécifiques
+            configs_latin = [
+                "--psm 3 -l fra+eng -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+                "--psm 7 -l fra+eng -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+                "--psm 8 -l fra+eng -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+                "--psm 13 -l fra+eng -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+                "--psm 6 -l fra+eng -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+            ]
+            configs_arabic = [
+                "--psm 3 -l ara --oem 3",
+                "--psm 7 -l ara --oem 3",
+                "--psm 8 -l ara --oem 3",
+                "--psm 13 -l ara --oem 3",
+            ]
+
+            for name, variant in variants:
+                for config in configs_latin:
+                    text = pytesseract.image_to_string(variant, config=config)
+                    cleaned = self._clean_plate(text)
+                    if cleaned:
+                        print(f"[OCR] OK latin/{name}: [{cleaned}]")
+                        return cleaned
+                for config in configs_arabic:
+                    text = pytesseract.image_to_string(variant, config=config)
+                    cleaned = self._clean_plate(text)
+                    if cleaned:
+                        print(f"[OCR] OK arabe/{name}: [{cleaned}]")
+                        return cleaned
+
+            return None
+        except Exception as e:
+            print(f"[YOLO][OCR] Erreur Tesseract: {e}")
             return None
 
     def _contour_ocr(self, cropped: np.ndarray) -> Optional[str]:
         try:
             gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            gray = cv2.resize(gray, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-            kernel = np.ones((2, 2), np.uint8)
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+            thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 31, 10,
+            )
 
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            contours = [c for c in contours if 20 < cv2.contourArea(c) < 5000]
+            configs = [
+                "--psm 3 -l fra+eng --oem 3",
+                "--psm 7 -l fra+eng --oem 3",
+                "--psm 8 -l fra+eng --oem 3",
+                "--psm 13 -l fra+eng --oem 3",
+                "--psm 7 -l ara --oem 3",
+                "--psm 8 -l ara --oem 3",
+                "--psm 13 -l ara --oem 3",
+            ]
+            for config in configs:
+                text = pytesseract.image_to_string(thresh, config=config)
+                cleaned = self._clean_plate(text)
+                if cleaned:
+                    return cleaned
 
-            bounds = [cv2.boundingRect(c) for c in contours]
-            bounds.sort(key=lambda b: b[0])
-
-            chars = []
-            for x, y, w, h in bounds:
-                aspect = h / max(1, w)
-                if 1.2 < aspect < 6.0 and h > 20:
-                    char_roi = thresh[y:y + h, x:x + w]
-                    ratio = h / 50.0
-                    resized = cv2.resize(char_roi, (int(25 * ratio), 50))
-                    chars.append(resized)
-
-            if len(chars) >= 3:
-                return "?PLAQUE?"
             return None
         except Exception:
             return None
 
     @staticmethod
     def _clean_plate(text: str) -> Optional[str]:
-        cleaned = "".join(c for c in text.strip() if c.isalnum() or c in "- ").strip()
-        cleaned = cleaned.upper()
-        if "-" not in cleaned and len(cleaned) >= 6:
-            cleaned = cleaned[:3] + "-" + cleaned[3:]
-        if cleaned and 4 <= len(cleaned) <= 12:
-            return cleaned
-        return None
+        cleaned = "".join(c for c in text.strip() if 'A' <= c.upper() <= 'Z' or '0' <= c <= '9').strip().upper()
+        if len(cleaned) < 5 or len(cleaned) > 12:
+            return None
+        letters = sum('A' <= c <= 'Z' for c in cleaned)
+        digits = sum('0' <= c <= '9' for c in cleaned)
+        if letters < 2 or digits < 1:
+            return None
+        return cleaned
 
     # ── High-level scan ────────────────────────────────────────────────────
 
@@ -328,17 +548,22 @@ class YoloService:
             if not ok:
                 return {"plate": None, "image_b64": None,
                         "error": "Caméra non disponible"}
-            time.sleep(0.5)
+            # Laisser la caméra s'ajuster (exposition, focus, balance blancs)
+            for _ in range(10):
+                self._grab_frame()
+                time.sleep(0.3)
 
-        plate, img_bytes = self.detect_plate()
-        image_b64 = base64.b64encode(img_bytes).decode() if img_bytes else None
-        self._last_detected_plate = plate
-        self._last_detected_image = img_bytes
+        for attempt in range(15):
+            plate, img_bytes = self.detect_plate()
+            if plate:
+                image_b64 = base64.b64encode(img_bytes).decode() if img_bytes else None
+                self._last_detected_plate = plate
+                self._last_detected_image = img_bytes
+                self._last_detection_time = time.time()
+                return {"plate": plate, "image_b64": image_b64, "error": None}
+            time.sleep(0.3)
 
-        if plate:
-            self._last_detection_time = time.time()
-
-        return {"plate": plate, "image_b64": image_b64, "error": None}
+        return {"plate": None, "image_b64": None, "error": "Aucune plaque détectée après plusieurs essais"}
 
     # ── Continuous monitoring ──────────────────────────────────────────────
 

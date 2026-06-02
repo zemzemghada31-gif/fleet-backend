@@ -2,17 +2,14 @@ from database import engine, Base
 import asyncio
 import math
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form, status
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
-import csv
-import io
 import random
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-from database import init_db, get_db, DeviceModel, VehicleModel, MaintenanceLogModel, EntryExitModel, GPSHistoryModel, UserModel, AccessRuleModel, AccessLogModel, DeliveryModel, AsyncSessionLocal
+from sqlalchemy import select, func, or_
+from database import init_db, get_db, DeviceModel, VehicleModel, MaintenanceLogModel, EntryExitModel, GPSHistoryModel, UserModel, AccessRuleModel, AccessLogModel, DeliveryModel, RouteModel, RoutePointModel, StopModel, EventModel, AsyncSessionLocal
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
@@ -20,6 +17,8 @@ import bcrypt as _bcrypt
 import cv2
 import numpy as np
 import base64
+import tempfile
+from pathlib import Path
 
 def _hash_password(pw: str) -> str:
     return _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt()).decode()
@@ -60,8 +59,8 @@ async def lifespan(app: FastAPI):
             # Ajouter beaucoup de devices (trackers GPS)
             devices = [
                 # Apex Tracker V3
-                DeviceModel(id="X-9941-ALPHA", model="Apex Tracker V3", assignment="ASSIGNED", last_connection="2 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Mercedes-Benz Actros (BT-904-TX)", assigned_since="2025-03-10 14:30"),
-                DeviceModel(id="X-1001-BETA", model="Apex Tracker V3", assignment="ASSIGNED", last_connection="5 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Volvo FH (TX-4409-LP)", assigned_since="2025-04-01 09:15"),
+                DeviceModel(id="X-9941-ALPHA", model="Apex Tracker V3", assignment="ASSIGNED", last_connection="2 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Mercedes-Benz Actros (123-TUN-45)", assigned_since="2025-03-10 14:30"),
+                DeviceModel(id="X-1001-BETA", model="Apex Tracker V3", assignment="ASSIGNED", last_connection="5 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Volvo FH (789-SF-01)", assigned_since="2025-04-01 09:15"),
                 DeviceModel(id="X-1002-GAMMA", model="Apex Tracker V3", assignment="ASSIGNED", last_connection="12 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Renault Trucks D (FR-4401-P)", assigned_since="2025-02-18 11:00"),
                 DeviceModel(id="X-1003-DELTA", model="Apex Tracker V3", assignment="UNASSIGNED", last_connection="1 hr ago", status_color="0xFF64748B", assigned_vehicle="—", assigned_since="—"),
                 DeviceModel(id="X-1004-EPSILON", model="Apex Tracker V3", assignment="MAINTENANCE", last_connection="3 days ago", status_color="0xFFF59E0B", assigned_vehicle="—", assigned_since="—"),
@@ -72,32 +71,32 @@ async def lifespan(app: FastAPI):
                 DeviceModel(id="X-1009-LAMBDA", model="Apex Tracker V3", assignment="MAINTENANCE", last_connection="1 week ago", status_color="0xFFF59E0B", assigned_vehicle="—", assigned_since="—"),
                 # Core Link Hub
                 DeviceModel(id="X-8820-BETA", model="Core Link Hub", assignment="UNASSIGNED", last_connection="14 hrs ago", status_color="0xFF64748B", assigned_vehicle="—", assigned_since="—"),
-                DeviceModel(id="X-8821-GAMMA", model="Core Link Hub", assignment="ASSIGNED", last_connection="3 mins ago", status_color="0xFF3B82F6", assigned_vehicle="DAF XF (PY-456-RT)", assigned_since="2025-01-15 10:30"),
+                DeviceModel(id="X-8821-GAMMA", model="Core Link Hub", assignment="ASSIGNED", last_connection="3 mins ago", status_color="0xFF3B82F6", assigned_vehicle="DAF XF (333-BEN-44)", assigned_since="2025-01-15 10:30"),
                 DeviceModel(id="X-8822-DELTA", model="Core Link Hub", assignment="ASSIGNED", last_connection="45 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Volvo FM (NN-303-LP)", assigned_since="2025-04-10 07:00"),
                 DeviceModel(id="X-8823-EPSILON", model="Core Link Hub", assignment="MAINTENANCE", last_connection="2 days ago", status_color="0xFFF59E0B", assigned_vehicle="—", assigned_since="—"),
-                DeviceModel(id="X-8824-ZETA", model="Core Link Hub", assignment="ASSIGNED", last_connection="10 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Renault Trucks T (CI-789-YU)", assigned_since="2025-05-05 12:00"),
+                DeviceModel(id="X-8824-ZETA", model="Core Link Hub", assignment="ASSIGNED", last_connection="10 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Renault Trucks T (555-MON-66)", assigned_since="2025-05-05 12:00"),
                 DeviceModel(id="X-8825-THETA", model="Core Link Hub", assignment="UNASSIGNED", last_connection="8 hrs ago", status_color="0xFF64748B", assigned_vehicle="—", assigned_since="—"),
                 DeviceModel(id="X-8826-IOTA", model="Core Link Hub", assignment="ASSIGNED", last_connection="Just now", status_color="0xFF3B82F6", assigned_vehicle="Ford F-MAX (FR-606-TY)", assigned_since="2025-04-18 09:30"),
                 DeviceModel(id="X-8827-KAPPA", model="Core Link Hub", assignment="ASSIGNED", last_connection="25 mins ago", status_color="0xFF3B82F6", assigned_vehicle="MAN TGS (TY-404-ER)", assigned_since="2025-03-05 14:15"),
                 # Nano Sensor X1
-                DeviceModel(id="X-7701-ALPHA", model="Nano Sensor X1", assignment="ASSIGNED", last_connection="15 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Mercedes-Benz Arocs (VB-101-PO)", assigned_since="2025-02-28 16:00"),
+                DeviceModel(id="X-7701-ALPHA", model="Nano Sensor X1", assignment="ASSIGNED", last_connection="15 mins ago", status_color="0xFF3B82F6", assigned_vehicle="Mercedes-Benz Arocs (777-SUS-88)", assigned_since="2025-02-28 16:00"),
                 DeviceModel(id="X-7702-BETA", model="Nano Sensor X1", assignment="UNASSIGNED", last_connection="6 hrs ago", status_color="0xFF64748B", assigned_vehicle="—", assigned_since="—"),
-                DeviceModel(id="X-7703-GAMMA", model="Nano Sensor X1", assignment="ASSIGNED", last_connection="1 min ago", status_color="0xFF3B82F6", assigned_vehicle="Scania R-Series (CA-123-VN)", assigned_since="2025-04-29 11:45"),
+                DeviceModel(id="X-7703-GAMMA", model="Nano Sensor X1", assignment="ASSIGNED", last_connection="1 min ago", status_color="0xFF3B82F6", assigned_vehicle="Scania R-Series (456-NBL-78)", assigned_since="2025-04-29 11:45"),
                 DeviceModel(id="X-7704-DELTA", model="Nano Sensor X1", assignment="MAINTENANCE", last_connection="4 days ago", status_color="0xFFF59E0B", assigned_vehicle="—", assigned_since="—"),
-                DeviceModel(id="X-7705-EPSILON", model="Nano Sensor X1", assignment="ASSIGNED", last_connection="20 mins ago", status_color="0xFF3B82F6", assigned_vehicle="MAN TGX (ZZ-123-ZZ)", assigned_since="2025-05-08 10:00"),
+                DeviceModel(id="X-7705-EPSILON", model="Nano Sensor X1", assignment="ASSIGNED", last_connection="20 mins ago", status_color="0xFF3B82F6", assigned_vehicle="MAN TGX (111-ARI-22)", assigned_since="2025-05-08 10:00"),
                 DeviceModel(id="X-7706-ZETA", model="Nano Sensor X1", assignment="ASSIGNED", last_connection="Just now", status_color="0xFF3B82F6", assigned_vehicle="Renault Trucks D (FR-4401-P)", assigned_since="2025-04-12 08:30"),
             ]
             session.add_all(devices)
 
             # Ajouter beaucoup de véhicules
             vehicles = [
-                VehicleModel(id=1, model="Mercedes-Benz Actros", plate="BT-904-TX", status="ACTIVE", tracker="X-9941-ALPHA", lat=41.8781, lng=-87.6298, speed=68.0, fuel=92, driver="Marcus Reed", eta="4.2H TO GO", heading="NE"),
-                VehicleModel(id=2, model="Scania R-Series", plate="CA-123-VN", status="MAINTENANCE", tracker="Not Assigned", lat=37.3382, lng=-121.8863, speed=0.0, fuel=44, driver="Sarah Kim", eta="OFFLOADING", heading="—"),
-                VehicleModel(id=3, model="Volvo FH", plate="TX-4409-LP", status="IDLE", tracker="ST-112-BETA", lat=37.7749, lng=-122.4194, speed=0.0, fuel=88, driver="Kevin Park", eta="LOADING", heading="—"),
-                VehicleModel(id=4, model="MAN TGX", plate="ZZ-123-ZZ", status="ACTIVE", tracker="Not Assigned", lat=48.8566, lng=2.3522, speed=45.0, fuel=76, driver="Pierre Dubois", eta="2.1H TO GO", heading="SE"),
-                VehicleModel(id=5, model="DAF XF", plate="PY-456-RT", status="ACTIVE", tracker="ST-449-ALPHA", lat=45.7640, lng=4.8357, speed=52.0, fuel=61, driver="Marie Laurent", eta="1.8H TO GO", heading="SW"),
-                VehicleModel(id=6, model="Renault Trucks T", plate="CI-789-YU", status="IDLE", tracker="ST-112-BETA", lat=43.6047, lng=1.4442, speed=0.0, fuel=95, driver="Jean Moreau", eta="—", heading="—"),
-                VehicleModel(id=7, model="Mercedes-Benz Arocs", plate="VB-101-PO", status="MAINTENANCE", tracker="Not Assigned", lat=52.5200, lng=13.4050, speed=0.0, fuel=33, driver="Hans Schmidt", eta="OFFLOADING", heading="—"),
+                VehicleModel(id=1, model="Mercedes-Benz Actros", plate="123-TUN-45", status="ACTIVE", tracker="X-9941-ALPHA", lat=41.8781, lng=-87.6298, speed=68.0, fuel=92, driver="Marcus Reed", eta="4.2H TO GO", heading="NE"),
+                VehicleModel(id=2, model="Scania R-Series", plate="456-NBL-78", status="MAINTENANCE", tracker="Not Assigned", lat=37.3382, lng=-121.8863, speed=0.0, fuel=44, driver="Sarah Kim", eta="OFFLOADING", heading="—"),
+                VehicleModel(id=3, model="Volvo FH", plate="789-SF-01", status="IDLE", tracker="ST-112-BETA", lat=37.7749, lng=-122.4194, speed=0.0, fuel=88, driver="Kevin Park", eta="LOADING", heading="—"),
+                VehicleModel(id=4, model="MAN TGX", plate="111-ARI-22", status="ACTIVE", tracker="Not Assigned", lat=48.8566, lng=2.3522, speed=45.0, fuel=76, driver="Pierre Dubois", eta="2.1H TO GO", heading="SE"),
+                VehicleModel(id=5, model="DAF XF", plate="333-BEN-44", status="ACTIVE", tracker="ST-449-ALPHA", lat=45.7640, lng=4.8357, speed=52.0, fuel=61, driver="Marie Laurent", eta="1.8H TO GO", heading="SW"),
+                VehicleModel(id=6, model="Renault Trucks T", plate="555-MON-66", status="IDLE", tracker="ST-112-BETA", lat=43.6047, lng=1.4442, speed=0.0, fuel=95, driver="Jean Moreau", eta="—", heading="—"),
+                VehicleModel(id=7, model="Mercedes-Benz Arocs", plate="777-SUS-88", status="MAINTENANCE", tracker="Not Assigned", lat=52.5200, lng=13.4050, speed=0.0, fuel=33, driver="Hans Schmidt", eta="OFFLOADING", heading="—"),
                 VehicleModel(id=8, model="Scania G-Series", plate="FI-202-IK", status="ACTIVE", tracker="ST-449-ALPHA", lat=41.9028, lng=12.4964, speed=71.0, fuel=84, driver="Luigi Rossi", eta="3.5H TO GO", heading="NE"),
                 VehicleModel(id=9, model="Volvo FM", plate="NN-303-LP", status="ACTIVE", tracker="ST-112-BETA", lat=35.6762, lng=139.6503, speed=48.0, fuel=67, driver="Yuki Tanaka", eta="5.1H TO GO", heading="E"),
                 VehicleModel(id=10, model="MAN TGS", plate="TY-404-ER", status="IDLE", tracker="Not Assigned", lat=51.5074, lng=-0.1278, speed=0.0, fuel=91, driver="James Wilson", eta="—", heading="—"),
@@ -122,16 +121,16 @@ async def lifespan(app: FastAPI):
 
             # Ajouter des logs d'entrée/sortie
             gates = ["Main Gate", "East Gate", "West Gate", "South Gate"]
-            plates = ["BT-904-TX", "CA-123-VN", "TX-4409-LP", "ZZ-123-ZZ", "PY-456-RT", "CI-789-YU", "VB-101-PO", "FI-202-IK", "NN-303-LP", "TY-404-ER"]
-            models = ["Mercedes-Benz Actros", "Scania R-Series", "Volvo FH", "MAN TGX", "DAF XF", "Renault Trucks T", "Mercedes-Benz Arocs", "Scania G-Series", "Volvo FM", "MAN TGS"]
-            drivers = ["Marcus Reed", "Sarah Kim", "Kevin Park", "Pierre Dubois", "Marie Laurent", "Jean Moreau", "Hans Schmidt", "Luigi Rossi", "Yuki Tanaka", "James Wilson"]
+            plates = ["123-TUN-45", "456-NBL-78", "789-SF-01", "111-ARI-22", "333-BEN-44", "555-MON-66", "777-SUS-88", "FI-202-IK", "NN-303-LP", "TY-404-ER", "HY-505-UI", "FR-606-TY", "CO-7710-D", "FR-4401-P"]
+            models = ["Mercedes-Benz Actros", "Scania R-Series", "Volvo FH", "MAN TGX", "DAF XF", "Renault Trucks T", "Mercedes-Benz Arocs", "Scania G-Series", "Volvo FM", "MAN TGS", "Iveco S-Way", "Ford F-MAX", "DAF CF", "Renault Trucks D"]
+            drivers = ["Marcus Reed", "Sarah Kim", "Kevin Park", "Pierre Dubois", "Marie Laurent", "Jean Moreau", "Hans Schmidt", "Luigi Rossi", "Yuki Tanaka", "James Wilson", "Min-Jun Kim", "Jack Thompson", "Amanda Lee", "Lucas Moreau"]
             entries = []
             for i in range(30):
                 base = datetime.now() - timedelta(days=random.randint(0, 14), hours=random.randint(0, 23))
                 entry = base
                 exit = entry + timedelta(hours=random.randint(1, 12)) if random.random() > 0.15 else None
                 entries.append(EntryExitModel(
-                    vehicle_id=random.randint(1, 12),
+                    vehicle_id=random.randint(1, 14),
                     vehicle_plate=random.choice(plates),
                     vehicle_model=random.choice(models),
                     driver=random.choice(drivers),
@@ -181,37 +180,55 @@ async def lifespan(app: FastAPI):
             session.add_all(deliveries)
             await session.commit()
 
-    # Seed access rules
+    # Seed access rules (ajout sécurisé : ne crée que les règles manquantes)
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(AccessRuleModel))
-        if not result.scalars().first():
-            rules = [
-                AccessRuleModel(vehicle_plate="BT-904-TX", vehicle_model="Mercedes-Benz Actros", allowed=True, gate="Entrée"),
-                AccessRuleModel(vehicle_plate="BT-904-TX", vehicle_model="Mercedes-Benz Actros", allowed=True, gate="Sortie"),
-                AccessRuleModel(vehicle_plate="CA-123-VN", vehicle_model="Scania R-Series", allowed=True, gate="Entrée"),
-                AccessRuleModel(vehicle_plate="CA-123-VN", vehicle_model="Scania R-Series", allowed=True, gate="Sortie"),
-                AccessRuleModel(vehicle_plate="TX-4409-LP", vehicle_model="Volvo FH", allowed=True, gate="Entrée"),
-                AccessRuleModel(vehicle_plate="TX-4409-LP", vehicle_model="Volvo FH", allowed=True, gate="Sortie"),
-                AccessRuleModel(vehicle_plate="ZZ-123-ZZ", vehicle_model="MAN TGX", allowed=True, gate="Entrée"),
-                AccessRuleModel(vehicle_plate="PY-456-RT", vehicle_model="DAF XF", allowed=True, gate="Entrée"),
-                AccessRuleModel(vehicle_plate="CI-789-YU", vehicle_model="Renault Trucks T", allowed=True, gate="Sortie"),
-                AccessRuleModel(vehicle_plate="VB-101-PO", vehicle_model="Mercedes-Benz Arocs", allowed=False, gate="Entrée", time_start="06:00", time_end="22:00"),
-                AccessRuleModel(vehicle_plate="FI-202-IK", vehicle_model="Scania G-Series", allowed=True, gate="Entrée"),
-                AccessRuleModel(vehicle_plate="NN-303-LP", vehicle_model="Volvo FM", allowed=True, gate="Sortie"),
-                AccessRuleModel(vehicle_plate="FR-606-TY", vehicle_model="Ford F-MAX", allowed=False, gate="Entrée"),
-                AccessRuleModel(vehicle_plate="CO-7710-D", vehicle_model="DAF CF", allowed=True, gate="Entrée"),
-                AccessRuleModel(vehicle_plate="CO-7710-D", vehicle_model="DAF CF", allowed=True, gate="Sortie"),
-            ]
-            session.add_all(rules)
-            await session.commit()
+        required_rules = [
+            ("123-TUN-45", "Mercedes-Benz Actros", True, "Entrée", None, None),
+            ("123-TUN-45", "Mercedes-Benz Actros", True, "Sortie", None, None),
+            ("456-NBL-78", "Scania R-Series", True, "Entrée", None, None),
+            ("456-NBL-78", "Scania R-Series", True, "Sortie", None, None),
+            ("789-SF-01", "Volvo FH", True, "Entrée", None, None),
+            ("789-SF-01", "Volvo FH", True, "Sortie", None, None),
+            ("111-ARI-22", "MAN TGX", True, "Entrée", None, None),
+            ("333-BEN-44", "DAF XF", True, "Entrée", None, None),
+            ("555-MON-66", "Renault Trucks T", True, "Sortie", None, None),
+            ("777-SUS-88", "Mercedes-Benz Arocs", False, "Entrée", "06:00", "22:00"),
+            ("FI-202-IK", "Scania G-Series", True, "Entrée", None, None),
+            ("NN-303-LP", "Volvo FM", True, "Sortie", None, None),
+            ("FR-606-TY", "Ford F-MAX", False, "Entrée", None, None),
+            ("CO-7710-D", "DAF CF", True, "Entrée", None, None),
+            ("CO-7710-D", "DAF CF", True, "Sortie", None, None),
+            ("HY-505-UI", "Iveco S-Way", True, "Entrée", None, None),
+            ("HY-505-UI", "Iveco S-Way", True, "Sortie", None, None),
+            ("TY-404-ER", "MAN TGS", True, "Entrée", None, None),
+            ("TY-404-ER", "MAN TGS", True, "Sortie", None, None),
+            ("FR-4401-P", "Renault Trucks D", True, "Entrée", None, None),
+            ("FR-4401-P", "Renault Trucks D", True, "Sortie", None, None),
+        ]
+        for plate, model, allowed, gate, t_start, t_end in required_rules:
+            existing = await session.execute(
+                select(AccessRuleModel).where(
+                    AccessRuleModel.vehicle_plate == plate,
+                    AccessRuleModel.gate == gate,
+                )
+            )
+            if not existing.scalar_one_or_none():
+                kw = {"time_start": t_start, "time_end": t_end} if t_start else {}
+                rule = AccessRuleModel(
+                    vehicle_plate=plate, vehicle_model=model,
+                    allowed=allowed, gate=gate, **kw,
+                )
+                session.add(rule)
+        await session.commit()
 
     # Seed access logs
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(AccessLogModel))
         if not result.scalars().first():
             gates = ["Entrée", "Sortie"]
-            plates = ["BT-904-TX", "CA-123-VN", "TX-4409-LP", "ZZ-123-ZZ", "PY-456-RT",
-                      "CI-789-YU", "VB-101-PO", "FI-202-IK", "NN-303-LP", "FR-606-TY"]
+            plates = ["123-TUN-45", "456-NBL-78", "789-SF-01", "111-ARI-22", "333-BEN-44",
+                      "555-MON-66", "777-SUS-88", "FI-202-IK", "NN-303-LP", "TY-404-ER",
+                      "HY-505-UI", "FR-606-TY", "CO-7710-D", "FR-4401-P"]
             actions = ["ENTRY", "EXIT"]
             logs = []
             for i in range(40):
@@ -276,8 +293,16 @@ async def _simulate_gps_movement():
         await asyncio.sleep(3)
         try:
             async with AsyncSessionLocal() as session:
+                skip_time = datetime.utcnow() - timedelta(seconds=60)
                 result = await session.execute(
-                    select(VehicleModel).where(VehicleModel.status == "ACTIVE")
+                    select(VehicleModel).where(
+                        VehicleModel.status == "ACTIVE",
+                        VehicleModel.is_deleted == False,
+                        or_(
+                            VehicleModel.last_gps_update == None,
+                            VehicleModel.last_gps_update < skip_time
+                        )
+                    )
                 )
                 vehicles = result.scalars().all()
                 for v in vehicles:
@@ -286,6 +311,8 @@ async def _simulate_gps_movement():
                     v.lng += dlng + (random.random() * 0.0002 - 0.0001)
                     v.speed = max(0, v.speed + random.uniform(-3, 3))
                     v.fuel = max(0, min(100, v.fuel - (1 if random.random() < 0.3 else 0)))
+                    # Record route, stops, events in real time
+                    await _record_gps_telemetry(v, session)
 
                 # Geo-fence check: see if any active vehicle arrived at destination
                 if vehicles:
@@ -569,6 +596,291 @@ def _delivery_to_out(d: DeliveryModel, vehicle: Optional[VehicleModel] = None) -
         notes=d.notes,
     )
 
+# ── Route / Stop / Event Models ──
+
+class RouteOut(BaseModel):
+    id: int
+    vehicle_id: int
+    vehicle_plate: str
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    status: str = "active"
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+    distance_km: float = 0.0
+    max_speed: float = 0.0
+    point_count: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+class RoutePointOut(BaseModel):
+    id: int
+    route_id: int
+    lat: float
+    lng: float
+    speed: float
+    heading: str
+    fuel: int
+    timestamp: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+class StopOut(BaseModel):
+    id: int
+    route_id: int
+    vehicle_id: int
+    vehicle_plate: str
+    lat: float
+    lng: float
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    stop_type: str
+    duration_minutes: int = 0
+    location_name: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+class EventOut(BaseModel):
+    id: int
+    route_id: int
+    vehicle_id: int
+    vehicle_plate: str
+    event_type: str
+    description: str
+    lat: float
+    lng: float
+    timestamp: Optional[str] = None
+    severity: str = "info"
+
+    model_config = ConfigDict(from_attributes=True)
+
+# ── Real‑time tracking state (in‑memory) ──
+
+_active_routes: dict[int, int] = {}            # vehicle_id → route_id
+_stop_start: dict[int, datetime] = {}          # vehicle_id → stop start time
+_stop_latlng: dict[int, tuple[float, float]] = {}  # vehicle_id → (lat, lng)
+_prev_speed: dict[int, float] = {}             # vehicle_id → previous speed
+_last_point_time: dict[int, datetime] = {}     # vehicle_id → last point timestamp
+
+SPEED_ALERT_THRESHOLD = 120.0  # km/h
+STOP_DETECTION_SECONDS = 30
+ROUTE_IDLE_SECONDS = 300  # 5 min without movement = route ends
+
+# ── Tracking helpers ──
+
+async def _ensure_active_route(vehicle: VehicleModel, db: AsyncSession) -> int:
+    """Return route_id for vehicle's active route, creating one if needed."""
+    vehicle_id = vehicle.id
+    if vehicle_id in _active_routes:
+        route_id = _active_routes[vehicle_id]
+        route = await db.get(RouteModel, route_id)
+        if route and route.status == "active":
+            return route_id
+    # Check DB for any active route
+    result = await db.execute(
+        select(RouteModel).where(
+            RouteModel.vehicle_id == vehicle_id,
+            RouteModel.status == "active",
+        ).limit(1)
+    )
+    route = result.scalar_one_or_none()
+    if route:
+        _active_routes[vehicle_id] = route.id
+        return route.id
+    # Create new route
+    route = RouteModel(
+        vehicle_id=vehicle_id,
+        vehicle_plate=vehicle.plate,
+        start_time=datetime.utcnow(),
+        status="active",
+        start_lat=vehicle.lat,
+        start_lng=vehicle.lng,
+    )
+    db.add(route)
+    await db.commit()
+    await db.refresh(route)
+    _active_routes[vehicle_id] = route.id
+    return route.id
+
+async def _add_route_point(route_id: int, vehicle: VehicleModel, db: AsyncSession):
+    point = RoutePointModel(
+        route_id=route_id,
+        lat=vehicle.lat,
+        lng=vehicle.lng,
+        speed=vehicle.speed or 0,
+        heading=vehicle.heading or "N",
+        fuel=vehicle.fuel or 0,
+        timestamp=datetime.utcnow(),
+    )
+    db.add(point)
+    _last_point_time[vehicle.id] = datetime.utcnow()
+
+async def _update_route_stats(route_id: int, vehicle: VehicleModel, db: AsyncSession):
+    route = await db.get(RouteModel, route_id)
+    if not route:
+        return
+    route.end_lat = vehicle.lat
+    route.end_lng = vehicle.lng
+    speed = vehicle.speed or 0
+    if speed > route.max_speed:
+        route.max_speed = speed
+    # Approximate distance increment (Haversine ~111km/deg)
+    if route.end_lat and route.end_lng:
+        dlat = (vehicle.lat - route.end_lat) * 111.0
+        mid_lat = math.radians((vehicle.lat + route.end_lat) / 2)
+        dlng = (vehicle.lng - route.end_lng) * 111.0 * math.cos(mid_lat)
+        route.distance_km += math.sqrt(dlat ** 2 + dlng ** 2)
+
+async def _check_stop_detection(vehicle: VehicleModel, db: AsyncSession):
+    """Detect when a vehicle stops (speed=0) and classify the stop."""
+    vehicle_id = vehicle.id
+    speed = vehicle.speed or 0
+    now = datetime.utcnow()
+
+    if speed == 0 and vehicle_id not in _stop_start:
+        # Vehicle just stopped
+        _stop_start[vehicle_id] = now
+        _stop_latlng[vehicle_id] = (vehicle.lat, vehicle.lng)
+    elif speed == 0 and vehicle_id in _stop_start:
+        elapsed = (now - _stop_start[vehicle_id]).total_seconds()
+        if elapsed >= STOP_DETECTION_SECONDS and vehicle_id in _active_routes:
+            # Classify stop type by duration
+            mins = int(elapsed / 60)
+            if mins < 5:
+                stype = "traffic"
+            elif mins < 15:
+                stype = "rest"
+            elif mins < 30:
+                stype = "cargo"
+            else:
+                stype = "fuel"
+            lat, lng = _stop_latlng.get(vehicle_id, (vehicle.lat, vehicle.lng))
+            route_id = _active_routes.get(vehicle_id)
+            if route_id:
+                stop = StopModel(
+                    route_id=route_id,
+                    vehicle_id=vehicle_id,
+                    vehicle_plate=vehicle.plate,
+                    lat=lat, lng=lng,
+                    start_time=_stop_start[vehicle_id],
+                    stop_type=stype,
+                    duration_minutes=mins,
+                )
+                db.add(stop)
+                # Create an event for the stop
+                event = EventModel(
+                    route_id=route_id,
+                    vehicle_id=vehicle_id,
+                    vehicle_plate=vehicle.plate,
+                    event_type="long_stop",
+                    description=f"Long stop detected ({mins}m) - {stype}",
+                    lat=lat, lng=lng,
+                    severity="info",
+                )
+                db.add(event)
+    elif speed > 0 and vehicle_id in _stop_start:
+        # Vehicle started moving again
+        if vehicle_id in _active_routes:
+            route_id = _active_routes[vehicle_id]
+            elapsed = (now - _stop_start[vehicle_id]).total_seconds()
+            if elapsed >= STOP_DETECTION_SECONDS:
+                mins = int(elapsed / 60)
+                stype = "traffic" if mins < 5 else "rest" if mins < 15 else "cargo" if mins < 30 else "fuel"
+                lat, lng = _stop_latlng.get(vehicle_id, (vehicle.lat, vehicle.lng))
+                stop = await db.execute(
+                    select(StopModel).where(
+                        StopModel.vehicle_id == vehicle_id,
+                        StopModel.end_time == None,
+                    ).order_by(StopModel.id.desc()).limit(1)
+                )
+                existing = stop.scalar_one_or_none()
+                if existing:
+                    existing.end_time = now
+                    existing.duration_minutes = mins
+        _stop_start.pop(vehicle_id, None)
+        _stop_latlng.pop(vehicle_id, None)
+
+async def _check_events(route_id: int, vehicle: VehicleModel, db: AsyncSession):
+    """Auto‑detect events based on telemetry."""
+    speed = vehicle.speed or 0
+    prev = _prev_speed.get(vehicle.id, speed)
+    vehicle_id = vehicle.id
+
+    # Speed alert
+    if speed > SPEED_ALERT_THRESHOLD:
+        event = EventModel(
+            route_id=route_id,
+            vehicle_id=vehicle_id,
+            vehicle_plate=vehicle.plate,
+            event_type="speed_alert",
+            description=f"Speed alert - {speed:.0f} km/h exceeded threshold",
+            lat=vehicle.lat, lng=vehicle.lng,
+            severity="critical",
+        )
+        db.add(event)
+
+    # Hard brake (speed drop > 30 km/h between updates)
+    if prev - speed > 30 and speed < 20:
+        event = EventModel(
+            route_id=route_id,
+            vehicle_id=vehicle_id,
+            vehicle_plate=vehicle.plate,
+            event_type="hard_brake",
+            description=f"Hard brake detected - speed dropped from {prev:.0f} to {speed:.0f} km/h",
+            lat=vehicle.lat, lng=vehicle.lng,
+            severity="warning",
+        )
+        db.add(event)
+
+    # Fuel drop
+    fuel = vehicle.fuel or 100
+    if hasattr(vehicle, '_last_fuel'):
+        drop = vehicle._last_fuel - fuel
+        if drop > 15:
+            event = EventModel(
+                route_id=route_id,
+                vehicle_id=vehicle_id,
+                vehicle_plate=vehicle.plate,
+                event_type="fuel_drop",
+                description=f"Fuel drop detected - {drop:.0f}% lost",
+                lat=vehicle.lat, lng=vehicle.lng,
+                severity="warning",
+            )
+            db.add(event)
+    vehicle._last_fuel = fuel
+
+    _prev_speed[vehicle.id] = speed
+
+async def _complete_idle_routes(db: AsyncSession):
+    """End routes for vehicles that have been idle for too long."""
+    now = datetime.utcnow()
+    for vehicle_id, last_time in list(_last_point_time.items()):
+        if vehicle_id not in _active_routes:
+            continue
+        elapsed = (now - last_time).total_seconds()
+        if elapsed > ROUTE_IDLE_SECONDS:
+            route_id = _active_routes.pop(vehicle_id)
+            route = await db.get(RouteModel, route_id)
+            if route and route.status == "active":
+                route.status = "completed"
+                route.end_time = now
+            _stop_start.pop(vehicle_id, None)
+            _stop_latlng.pop(vehicle_id, None)
+            _prev_speed.pop(vehicle_id, None)
+
+async def _record_gps_telemetry(vehicle: VehicleModel, db: AsyncSession):
+    """Main function: record route, point, stops, events for a vehicle update."""
+    speed = vehicle.speed or 0
+    if speed > 0:
+        route_id = await _ensure_active_route(vehicle, db)
+        await _add_route_point(route_id, vehicle, db)
+        await _update_route_stats(route_id, vehicle, db)
+        await _check_events(route_id, vehicle, db)
+    await _check_stop_detection(vehicle, db)
+    await _complete_idle_routes(db)
+
 # --- ANALYTICS HELPERS (Keep in memory as they are static/computed) ---
 
 _BASE_STATS = {
@@ -650,7 +962,7 @@ async def get_trends(period: str = "last_30_days", region: str = "all"):
 
 @app.get("/api/live")
 async def get_live_vehicles(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(VehicleModel))
+    result = await db.execute(select(VehicleModel).where(VehicleModel.is_deleted == False))
     vehicles = result.scalars().all()
     live_data = []
     for v in vehicles:
@@ -671,7 +983,12 @@ async def get_live_vehicles(db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/devices", response_model=List[Device])
 async def get_devices(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(DeviceModel))
+    result = await db.execute(select(DeviceModel).where(DeviceModel.is_deleted == False))
+    return result.scalars().all()
+
+@app.get("/api/devices/trash", response_model=List[Device])
+async def get_deleted_devices(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DeviceModel).where(DeviceModel.is_deleted == True))
     return result.scalars().all()
 
 @app.post("/api/devices")
@@ -699,13 +1016,29 @@ async def delete_device(device_id: str, db: AsyncSession = Depends(get_db)):
     db_device = await db.get(DeviceModel, device_id)
     if not db_device:
         raise HTTPException(status_code=404, detail="Device not found")
-    await db.delete(db_device)
+    db_device.is_deleted = True
+    db_device.deleted_at = datetime.utcnow()
     await db.commit()
-    return {"message": "Device deleted"}
+    return {"message": "Device moved to trash"}
+
+@app.post("/api/devices/{device_id}/restore")
+async def restore_device(device_id: str, db: AsyncSession = Depends(get_db)):
+    db_device = await db.get(DeviceModel, device_id)
+    if not db_device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    db_device.is_deleted = False
+    db_device.deleted_at = None
+    await db.commit()
+    return {"message": "Device restored"}
 
 @app.get("/api/vehicles", response_model=List[Vehicle])
 async def get_vehicles(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(VehicleModel))
+    result = await db.execute(select(VehicleModel).where(VehicleModel.is_deleted == False))
+    return result.scalars().all()
+
+@app.get("/api/vehicles/trash", response_model=List[Vehicle])
+async def get_deleted_vehicles(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(VehicleModel).where(VehicleModel.is_deleted == True))
     return result.scalars().all()
 
 @app.post("/api/vehicles")
@@ -721,7 +1054,7 @@ async def update_vehicle(vehicle_id: int, vehicle: Vehicle, db: AsyncSession = D
     db_vehicle = await db.get(VehicleModel, vehicle_id)
     if not db_vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    for key, value in vehicle.dict().items():
+    for key, value in vehicle.model_dump().items():
         setattr(db_vehicle, key, value)
     await db.commit()
     return {"message": "Vehicle updated"}
@@ -731,9 +1064,20 @@ async def delete_vehicle(vehicle_id: int, db: AsyncSession = Depends(get_db)):
     db_vehicle = await db.get(VehicleModel, vehicle_id)
     if not db_vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    await db.delete(db_vehicle)
+    db_vehicle.is_deleted = True
+    db_vehicle.deleted_at = datetime.utcnow()
     await db.commit()
-    return {"message": "Vehicle deleted"}
+    return {"message": "Vehicle moved to trash"}
+
+@app.post("/api/vehicles/{vehicle_id}/restore")
+async def restore_vehicle(vehicle_id: int, db: AsyncSession = Depends(get_db)):
+    db_vehicle = await db.get(VehicleModel, vehicle_id)
+    if not db_vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    db_vehicle.is_deleted = False
+    db_vehicle.deleted_at = None
+    await db.commit()
+    return {"message": "Vehicle restored"}
 
 @app.get("/api/maintenance/{vehicle_id}/logs", response_model=List[MaintenanceLog])
 async def get_maintenance_logs(vehicle_id: int, db: AsyncSession = Depends(get_db)):
@@ -840,8 +1184,11 @@ async def receive_gps(data: GPSData, db: AsyncSession = Depends(get_db)):
         v.lat = data.lat
         v.lng = data.lng
         v.speed = data.speed
-        v.heading = data.heading
+        v.heading = str(data.heading)
         v.fuel = data.fuel if data.fuel else v.fuel
+        v.last_gps_update = datetime.utcnow()
+        # Record route, stops, events in real time
+        await _record_gps_telemetry(v, db)
 
     device = await db.get(DeviceModel, data.device_id)
     if device:
@@ -895,6 +1242,118 @@ async def gps_ingress_get(
 ):
     data = GPSData(device_id=id, lat=lat, lng=lng, speed=speed, heading=heading, fuel=fuel)
     return await receive_gps(data, db)
+
+# ── ROUTE / STOP / EVENT ENDPOINTS ──
+
+@app.get("/api/routes/{vehicle_id}", response_model=List[RouteOut])
+async def get_vehicle_routes(vehicle_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(RouteModel).where(RouteModel.vehicle_id == vehicle_id).order_by(RouteModel.id.desc())
+    )
+    routes = result.scalars().all()
+    out = []
+    for r in routes:
+        count_result = await db.execute(
+            select(func.count()).select_from(RoutePointModel).where(RoutePointModel.route_id == r.id)
+        )
+        point_count = count_result.scalar() or 0
+        out.append(RouteOut(
+            id=r.id, vehicle_id=r.vehicle_id, vehicle_plate=r.vehicle_plate,
+            start_time=r.start_time.isoformat() if r.start_time else None,
+            end_time=r.end_time.isoformat() if r.end_time else None,
+            status=r.status, start_lat=r.start_lat, start_lng=r.start_lng,
+            end_lat=r.end_lat, end_lng=r.end_lng,
+            distance_km=round(r.distance_km, 2), max_speed=round(r.max_speed, 1),
+            point_count=point_count,
+        ))
+    return out
+
+@app.get("/api/routes/{vehicle_id}/active", response_model=Optional[RouteOut])
+async def get_active_route(vehicle_id: int, db: AsyncSession = Depends(get_db)):
+    route_id = _active_routes.get(vehicle_id)
+    if route_id:
+        route = await db.get(RouteModel, route_id)
+        if route and route.status == "active":
+            count_result = await db.execute(
+                select(func.count()).select_from(RoutePointModel).where(RoutePointModel.route_id == route.id)
+            )
+            point_count = count_result.scalar() or 0
+            return RouteOut(
+                id=route.id, vehicle_id=route.vehicle_id, vehicle_plate=route.vehicle_plate,
+                start_time=route.start_time.isoformat() if route.start_time else None,
+                end_time=route.end_time.isoformat() if route.end_time else None,
+                status=route.status, start_lat=route.start_lat, start_lng=route.start_lng,
+                end_lat=route.end_lat, end_lng=route.end_lng,
+                distance_km=round(route.distance_km, 2), max_speed=round(route.max_speed, 1),
+                point_count=point_count,
+            )
+    return None
+
+@app.get("/api/routes/{route_id}/points", response_model=List[RoutePointOut])
+async def get_route_points(route_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(RoutePointModel).where(RoutePointModel.route_id == route_id).order_by(RoutePointModel.id.asc())
+    )
+    points = result.scalars().all()
+    return [RoutePointOut(
+        id=p.id, route_id=p.route_id, lat=p.lat, lng=p.lng,
+        speed=p.speed, heading=p.heading, fuel=p.fuel,
+        timestamp=p.timestamp.isoformat() if p.timestamp else None,
+    ) for p in points]
+
+@app.get("/api/routes/{route_id}/stops", response_model=List[StopOut])
+async def get_route_stops(route_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(StopModel).where(StopModel.route_id == route_id).order_by(StopModel.start_time.asc())
+    )
+    stops = result.scalars().all()
+    return [StopOut(
+        id=s.id, route_id=s.route_id, vehicle_id=s.vehicle_id, vehicle_plate=s.vehicle_plate,
+        lat=s.lat, lng=s.lng, stop_type=s.stop_type, duration_minutes=s.duration_minutes,
+        location_name=s.location_name,
+        start_time=s.start_time.isoformat() if s.start_time else None,
+        end_time=s.end_time.isoformat() if s.end_time else None,
+    ) for s in stops]
+
+@app.get("/api/routes/{route_id}/events", response_model=List[EventOut])
+async def get_route_events(route_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(EventModel).where(EventModel.route_id == route_id).order_by(EventModel.timestamp.asc())
+    )
+    events = result.scalars().all()
+    return [EventOut(
+        id=e.id, route_id=e.route_id, vehicle_id=e.vehicle_id, vehicle_plate=e.vehicle_plate,
+        event_type=e.event_type, description=e.description,
+        lat=e.lat, lng=e.lng, severity=e.severity,
+        timestamp=e.timestamp.isoformat() if e.timestamp else None,
+    ) for e in events]
+
+@app.get("/api/vehicles/{vehicle_id}/stops", response_model=List[StopOut])
+async def get_vehicle_stops(vehicle_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(StopModel).where(StopModel.vehicle_id == vehicle_id).order_by(StopModel.start_time.desc()).limit(50)
+    )
+    stops = result.scalars().all()
+    return [StopOut(
+        id=s.id, route_id=s.route_id, vehicle_id=s.vehicle_id, vehicle_plate=s.vehicle_plate,
+        lat=s.lat, lng=s.lng, stop_type=s.stop_type, duration_minutes=s.duration_minutes,
+        location_name=s.location_name,
+        start_time=s.start_time.isoformat() if s.start_time else None,
+        end_time=s.end_time.isoformat() if s.end_time else None,
+    ) for s in stops]
+
+@app.get("/api/vehicles/{vehicle_id}/events", response_model=List[EventOut])
+async def get_vehicle_events(vehicle_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(EventModel).where(EventModel.vehicle_id == vehicle_id).order_by(EventModel.timestamp.desc()).limit(50)
+    )
+    events = result.scalars().all()
+    return [EventOut(
+        id=e.id, route_id=e.route_id, vehicle_id=e.vehicle_id, vehicle_plate=e.vehicle_plate,
+        event_type=e.event_type, description=e.description,
+        lat=e.lat, lng=e.lng, severity=e.severity,
+        timestamp=e.timestamp.isoformat() if e.timestamp else None,
+    ) for e in events]
 
 # ── AUTH ENDPOINTS ──
 
@@ -1039,10 +1498,10 @@ async def delete_access_rule(rule_id: int, user: UserModel = Depends(get_current
 
 @app.post("/api/access/check", response_model=AccessCheckResponse)
 async def check_access(data: AccessCheckRequest, db: AsyncSession = Depends(get_db)):
-    plate = data.vehicle_plate.upper()
+    plate_norm = data.vehicle_plate.upper().replace("-", "")
     result = await db.execute(
         select(AccessRuleModel).where(
-            AccessRuleModel.vehicle_plate == plate,
+            func.replace(AccessRuleModel.vehicle_plate, "-", "") == plate_norm,
             AccessRuleModel.gate == data.gate,
         )
     )
@@ -1061,7 +1520,9 @@ async def check_access(data: AccessCheckRequest, db: AsyncSession = Depends(get_
         )
     # Check if it's a known vehicle
     vehicle = await db.execute(
-        select(VehicleModel).where(VehicleModel.plate == plate)
+        select(VehicleModel).where(
+            func.replace(VehicleModel.plate, "-", "") == plate_norm
+        )
     )
     v = vehicle.scalar_one_or_none()
     if v:
@@ -1201,8 +1662,6 @@ async def confirm_delivery(delivery_id: int, user: UserModel = Depends(get_curre
 
 # ── YOLO / WEBCAM ENDPOINTS ──
 
-from pydantic import BaseModel
-
 from yolo_service import yolo_service as _yolo_svc
 
 class GateScanRequest(BaseModel):
@@ -1210,46 +1669,49 @@ class GateScanRequest(BaseModel):
 
 @app.post("/api/yolo/scan")
 async def yolo_scan(gate_req: GateScanRequest = GateScanRequest(), db: AsyncSession = Depends(get_db)):
-    _yolo_svc.start_camera()
-    result = _yolo_svc.scan_once()
-    plate = result.get("plate")
-    image_b64 = result.get("image_b64")
-    error = result.get("error")
+    try:
+        _yolo_svc.start_camera()
+        result = _yolo_svc.scan_once()
+        plate = result.get("plate")
+        image_b64 = result.get("image_b64")
+        error = result.get("error")
 
-    if error:
-        raise HTTPException(status_code=503, detail=error)
+        if error:
+            raise HTTPException(status_code=503, detail=error)
 
-    if not plate:
-        return {
-            "plate": None,
-            "granted": False,
-            "reason": "Aucune plaque détectée",
-            "image_b64": image_b64,
-        }
+        if not plate:
+            return {
+                "plate": None,
+                "granted": False,
+                "reason": "Aucune plaque détectée",
+                "image_b64": image_b64,
+            }
 
-    gate = gate_req.gate
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        gate = gate_req.gate
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
 
-    if gate == "Entrée":
-        access = await _check_access_for_plate(plate, db)
-        await _log_entry(plate, access, image_b64, now, db)
-        return {
-            "plate": plate,
-            "granted": access["granted"],
-            "reason": access["reason"],
-            "image_b64": image_b64,
-            "action": "ENTRY",
-        }
-    else:
-        entry_id = await _log_exit(plate, image_b64, now, db)
-        return {
-            "plate": plate,
-            "granted": True,
-            "reason": "Sortie enregistrée",
-            "image_b64": image_b64,
-            "action": "EXIT",
-            "entry_id": entry_id,
-        }
+        if gate == "Entrée":
+            access = await _check_access_for_plate(plate, db)
+            await _log_entry(plate, access, image_b64, now, db)
+            return {
+                "plate": plate,
+                "granted": access["granted"],
+                "reason": access["reason"],
+                "image_b64": image_b64,
+                "action": "ENTRY",
+            }
+        else:
+            entry_id = await _log_exit(plate, image_b64, now, db)
+            return {
+                "plate": plate,
+                "granted": True,
+                "reason": "Sortie enregistrée",
+                "image_b64": image_b64,
+                "action": "EXIT",
+                "entry_id": entry_id,
+            }
+    finally:
+        _yolo_svc.stop_camera()
 
 @app.get("/api/yolo/status")
 async def yolo_status():
@@ -1267,6 +1729,169 @@ async def yolo_stop_monitoring():
     _yolo_svc.stop_camera()
     return {"status": "monitoring_stopped"}
 
+
+@app.get("/api/yolo/diagnose")
+async def yolo_diagnose():
+    diag = _yolo_svc.get_status()
+    try:
+        import subprocess
+        from yolo_service import TESSERACT_CMD as _tess_cmd
+        r = subprocess.run(
+            [_tess_cmd, "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        diag["tesseract"] = {
+            "available": True,
+            "version": r.stdout.strip()[:80] if r.stdout else r.stderr.strip()[:80],
+        }
+    except Exception as e:
+        diag["tesseract"] = {"available": False, "error": str(e)}
+    diag["opencv_version"] = cv2.__version__
+    diag["onnxruntime_version"] = __import__("onnxruntime").__version__
+    return diag
+
+
+# ── DEBUG CAPTURE (sauvegarde l'image + infos) ─────────────────────────────
+
+_DEBUG_DIR = Path(tempfile.gettempdir()) / "fleet_debug"
+_DEBUG_DIR.mkdir(exist_ok=True)
+
+class DebugCaptureRequest(BaseModel):
+    gate: str = "Entrée"
+    image_b64: str = ""
+
+@app.post("/api/gate/debug-capture")
+async def gate_debug_capture(req: DebugCaptureRequest):
+    if req.gate not in ("Entrée", "Sortie"):
+        raise HTTPException(status_code=400, detail="Gate must be 'Entrée' or 'Sortie'")
+
+    try:
+        contents = base64.b64decode(req.image_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Image base64 invalide")
+
+    if not contents:
+        raise HTTPException(status_code=400, detail="Image vide")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    save_path = _DEBUG_DIR / f"capture_{ts}.jpg"
+    with open(save_path, "wb") as f:
+        f.write(contents)
+    print(f"[DEBUG] Image sauvegardee: {save_path} ({len(contents)} octets)")
+
+    arr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    info = {
+        "saved_path": str(save_path),
+        "file_size": len(contents),
+        "frame_shape": list(frame.shape) if frame is not None else None,
+    }
+
+    if frame is None:
+        info["error"] = "Impossible de decoder l'image"
+        return info
+
+    h, w = frame.shape[:2]
+    info["dimensions"] = f"{w}x{h}"
+    info["image_b64"] = req.image_b64
+
+    print(f"[DEBUG] Lancement detection sur {w}x{h}...")
+
+    import time as _time
+    t0 = _time.time()
+    plate_canny, _ = _yolo_svc._detect_canny_plate(frame)
+    info["canny_plate"] = plate_canny
+    info["canny_time_ms"] = int((_time.time() - t0) * 1000)
+
+    t0 = _time.time()
+    plate_grad, _ = _yolo_svc._detect_gradient_plate(frame)
+    info["gradient_plate"] = plate_grad
+    info["grad_time_ms"] = int((_time.time() - t0) * 1000)
+
+    t0 = _time.time()
+    ocr_full = _yolo_svc._ocr_read(frame)
+    info["ocr_full_image"] = ocr_full
+    info["ocr_full_time_ms"] = int((_time.time() - t0) * 1000)
+
+    t0 = _time.time()
+    plate_combined, img_bytes = _yolo_svc.detect_plate_from_frame(frame)
+    info["combined_result"] = plate_combined
+    info["combined_time_ms"] = int((_time.time() - t0) * 1000)
+
+    info["env_tesseract_cmd"] = os.environ.get("TESSERACT_CMD", "non defini")
+
+    print(f"[DEBUG] Resultats: canny={plate_canny} grad={plate_grad} ocr_full={ocr_full} combined={plate_combined}")
+    return info
+
+
+# ── QUICK SCAN (rapide : s'arrête au premier résultat) ────────────────────────
+
+class QuickScanRequest(BaseModel):
+    gate: str = "Entrée"
+    image_b64: str = ""
+
+@app.post("/api/gate/quick-scan")
+async def gate_quick_scan(req: QuickScanRequest, db: AsyncSession = Depends(get_db)):
+    if req.gate not in ("Entrée", "Sortie"):
+        raise HTTPException(status_code=400, detail="Gate must be 'Entrée' or 'Sortie'")
+
+    try:
+        contents = base64.b64decode(req.image_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Image base64 invalide")
+    if not contents:
+        raise HTTPException(status_code=400, detail="Image vide")
+
+    arr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Impossible de decoder l'image")
+
+    import time as _time
+    t0 = _time.time()
+
+    plate, img_bytes = _yolo_svc.detect_plate_from_frame(frame)
+    elapsed = int((_time.time() - t0) * 1000)
+
+    if not plate:
+        print(f"[QUICK] Aucune plaque detectee ({elapsed}ms)")
+        return {
+            "plate": None,
+            "combined_result": None,
+            "granted": False,
+            "reason": "Aucune plaque détectée",
+            "image_b64": req.image_b64,
+            "elapsed_ms": elapsed,
+        }
+
+    image_b64 = base64.b64encode(img_bytes).decode() if img_bytes else req.image_b64
+
+    # Vérifier accès et logger
+    access = await _check_access_for_plate(plate, db)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    if req.gate == "Entrée":
+        granted = access["granted"]
+        reason = access["reason"]
+        action = "ENTRY"
+        if granted:
+            await _log_entry(plate, access, image_b64, now, db)
+    else:
+        granted = True
+        action = "EXIT"
+        reason = "Sortie enregistrée"
+        entry_id = await _log_exit(plate, image_b64, now, db)
+
+    print(f"[QUICK] Plaque: {plate} | {action} | {'✅' if granted else '❌'} | {elapsed}ms")
+    return {
+        "plate": plate,
+        "combined_result": plate,
+        "granted": granted,
+        "reason": reason,
+        "image_b64": image_b64,
+        "action": action,
+        "elapsed_ms": elapsed,
+    }
 
 # ── DEDICATED CAPTURE ENDPOINT ──────────────────────────────────────────────
 
@@ -1291,9 +1916,12 @@ async def gate_capture(
         arr = np.frombuffer(contents, np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame is not None:
+            print(f"[YOLO] Image recue: {frame.shape[1]}x{frame.shape[0]}")
             p, _ = _yolo_svc.detect_plate_from_frame(frame)
             if p:
                 detected_plate = p
+            else:
+                print(f"[YOLO] Aucune plaque detectee dans l'image recue")
 
     if not detected_plate:
         return {
@@ -1328,10 +1956,10 @@ async def gate_capture(
 
 
 async def _check_access_for_plate(plate: str, db: AsyncSession) -> dict:
-    from sqlalchemy import select
+    plate_norm = plate.upper().replace("-", "")
     result = await db.execute(
         select(AccessRuleModel).where(
-            AccessRuleModel.vehicle_plate == plate.upper(),
+            func.replace(AccessRuleModel.vehicle_plate, "-", "") == plate_norm,
             AccessRuleModel.gate == "Entrée",
         )
     )
@@ -1342,7 +1970,9 @@ async def _check_access_for_plate(plate: str, db: AsyncSession) -> dict:
             "reason": "Accès autorisé" if rule.allowed else "Accès refusé par règle",
         }
     vehicle = await db.execute(
-        select(VehicleModel).where(VehicleModel.plate == plate.upper())
+        select(VehicleModel).where(
+            func.replace(VehicleModel.plate, "-", "") == plate_norm
+        )
     )
     v = vehicle.scalar_one_or_none()
     if v:
@@ -1351,8 +1981,9 @@ async def _check_access_for_plate(plate: str, db: AsyncSession) -> dict:
 
 
 async def _log_entry(plate: str, access: dict, image_b64: Optional[str], now: str, db: AsyncSession):
+    plate_norm = plate.upper()
     log = AccessLogModel(
-        vehicle_plate=plate.upper(),
+        vehicle_plate=plate_norm,
         action="ENTRY",
         gate="Entrée",
         granted=access["granted"],
@@ -1363,12 +1994,14 @@ async def _log_entry(plate: str, access: dict, image_b64: Optional[str], now: st
 
     if access["granted"]:
         vehicle = await db.execute(
-            select(VehicleModel).where(VehicleModel.plate == plate.upper())
+            select(VehicleModel).where(
+                func.replace(VehicleModel.plate, "-", "") == plate_norm.replace("-", "")
+            )
         )
         v = vehicle.scalar_one_or_none()
         entry = EntryExitModel(
             vehicle_id=v.id if v else 0,
-            vehicle_plate=plate.upper(),
+            vehicle_plate=plate_norm,
             vehicle_model=v.model if v else "Inconnu",
             driver=v.driver if v else None,
             entry_time=now,
@@ -1381,14 +2014,18 @@ async def _log_entry(plate: str, access: dict, image_b64: Optional[str], now: st
 
 
 async def _log_exit(plate: str, image_b64: Optional[str], now: str, db: AsyncSession) -> Optional[int]:
+    plate_norm = plate.upper()
+    plate_key = plate_norm.replace("-", "")
     vehicle = await db.execute(
-        select(VehicleModel).where(VehicleModel.plate == plate.upper())
+        select(VehicleModel).where(
+            func.replace(VehicleModel.plate, "-", "") == plate_key
+        )
     )
     v = vehicle.scalar_one_or_none()
 
     result = await db.execute(
         select(EntryExitModel).where(
-            EntryExitModel.vehicle_plate == plate.upper(),
+            func.replace(EntryExitModel.vehicle_plate, "-", "") == plate_key,
             EntryExitModel.status == "INSIDE",
         ).order_by(EntryExitModel.id.desc()).limit(1)
     )
@@ -1402,7 +2039,7 @@ async def _log_exit(plate: str, image_b64: Optional[str], now: str, db: AsyncSes
         entry_id = entry.id
 
     log = AccessLogModel(
-        vehicle_plate=plate.upper(),
+        vehicle_plate=plate_norm,
         action="EXIT",
         gate="Sortie",
         granted=True,
@@ -1441,6 +2078,12 @@ async def get_entry_exit_with_images(limit: int = 50, db: AsyncSession = Depends
         "has_image": e.image_b64 is not None,
     } for e in entries]
 
+
+# Servir le frontend Flutter compile (pas de CORS necessaire)
+_FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "build" / "web"
+if _FRONTEND_DIR.exists():
+    app.mount("/app", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
+    print(f"[FRONTEND] Serveur web: {_FRONTEND_DIR} -> /app")
 
 if __name__ == "__main__":
     import uvicorn

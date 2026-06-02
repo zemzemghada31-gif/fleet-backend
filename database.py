@@ -19,6 +19,8 @@ class DeviceModel(Base):
     status_color = Column(String(50))
     assigned_vehicle = Column(String(100), default="—")
     assigned_since = Column(String(50), default="—")
+    is_deleted = Column(Boolean, default=False)
+    deleted_at = Column(DateTime, nullable=True)
 class VehicleModel(Base):
     __tablename__ = "vehicles"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -33,10 +35,13 @@ class VehicleModel(Base):
     driver = Column(String(100), default="Unassigned")
     eta = Column(String(50), default="—")
     heading = Column(String(10), default="—")
+    last_gps_update = Column(DateTime, nullable=True)
+    is_deleted = Column(Boolean, default=False)
+    deleted_at = Column(DateTime, nullable=True)
 class MaintenanceLogModel(Base):
     __tablename__ = "maintenance_logs"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    vehicle_id = Column(Integer, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), index=True)
     date = Column(String(50))
     type = Column(String(50))
     title = Column(String(255))
@@ -46,7 +51,7 @@ class MaintenanceLogModel(Base):
 class EntryExitModel(Base):
     __tablename__ = "entry_exit"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    vehicle_id = Column(Integer, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), index=True)
     vehicle_plate = Column(String(20))
     vehicle_model = Column(String(100))
     driver = Column(String(100), nullable=True)
@@ -59,7 +64,7 @@ class EntryExitModel(Base):
 class GPSHistoryModel(Base):
     __tablename__ = "gps_history"
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    device_id = Column(String(255))
+    device_id = Column(String(100), ForeignKey("devices.id"))
     lat = Column(Float)
     lng = Column(Float)
     speed = Column(Float)
@@ -87,7 +92,7 @@ class AccessRuleModel(Base):
     gate = Column(String(50), default="Entrée")
     time_start = Column(String(5), default="00:00")
     time_end = Column(String(5), default="23:59")
-    created_by = Column(Integer, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class AccessLogModel(Base):
@@ -98,14 +103,14 @@ class AccessLogModel(Base):
     gate = Column(String(50))
     granted = Column(Boolean)
     reason = Column(String(255), nullable=True)
-    scanned_by = Column(Integer, nullable=True)
+    scanned_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     image_b64 = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 class DeliveryModel(Base):
     __tablename__ = "deliveries"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    vehicle_id = Column(Integer, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), index=True)
     vehicle_plate = Column(String(50))
     vehicle_model = Column(String(100), nullable=True)
     driver = Column(String(100), nullable=True)
@@ -118,19 +123,86 @@ class DeliveryModel(Base):
     delivered_at = Column(DateTime, nullable=True)
     notes = Column(String(500), nullable=True)
 
+# ── Route / Stop / Event models (real‑time tracking) ──
+
+class RouteModel(Base):
+    __tablename__ = "routes"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), index=True)
+    vehicle_plate = Column(String(20))
+    start_time = Column(DateTime, default=datetime.utcnow)
+    end_time = Column(DateTime, nullable=True)
+    status = Column(String(20), default="active")  # active / completed
+    start_lat = Column(Float, nullable=True)
+    start_lng = Column(Float, nullable=True)
+    end_lat = Column(Float, nullable=True)
+    end_lng = Column(Float, nullable=True)
+    distance_km = Column(Float, default=0.0)
+    max_speed = Column(Float, default=0.0)
+
+class RoutePointModel(Base):
+    __tablename__ = "route_points"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    route_id = Column(Integer, ForeignKey("routes.id"), index=True)
+    lat = Column(Float)
+    lng = Column(Float)
+    speed = Column(Float, default=0.0)
+    heading = Column(String(10), default="N")
+    fuel = Column(Integer, default=100)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class StopModel(Base):
+    __tablename__ = "route_stops"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    route_id = Column(Integer, ForeignKey("routes.id"), index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), index=True)
+    vehicle_plate = Column(String(20))
+    lat = Column(Float)
+    lng = Column(Float)
+    start_time = Column(DateTime, default=datetime.utcnow)
+    end_time = Column(DateTime, nullable=True)
+    stop_type = Column(String(50), default="rest")  # fuel / rest / cargo / traffic
+    duration_minutes = Column(Integer, default=0)
+    location_name = Column(String(255), nullable=True)
+
+class EventModel(Base):
+    __tablename__ = "route_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    route_id = Column(Integer, ForeignKey("routes.id"), index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), index=True)
+    vehicle_plate = Column(String(20))
+    event_type = Column(String(50))  # speed_alert / hard_brake / fuel_drop / long_stop / geofence
+    description = Column(String(500))
+    lat = Column(Float)
+    lng = Column(Float)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    severity = Column(String(20), default="info")  # info / warning / critical
+
+_FK_MIGRATIONS = [
+    ("maintenance_logs", "vehicle_id", "vehicles(id)", "fk_ml_vehicle"),
+    ("entry_exit", "vehicle_id", "vehicles(id)", "fk_ee_vehicle"),
+    ("gps_history", "device_id", "devices(id)", "fk_gh_device"),
+    ("deliveries", "vehicle_id", "vehicles(id)", "fk_del_vehicle"),
+    ("routes", "vehicle_id", "vehicles(id)", "fk_route_vehicle"),
+    ("route_points", "route_id", "routes(id)", "fk_rp_route"),
+    ("route_stops", "route_id", "routes(id)", "fk_rs_route"),
+    ("route_stops", "vehicle_id", "vehicles(id)", "fk_rs_vehicle"),
+    ("route_events", "route_id", "routes(id)", "fk_re_route"),
+    ("route_events", "vehicle_id", "vehicles(id)", "fk_re_vehicle"),
+    ("access_rules", "created_by", "users(id)", "fk_ar_user"),
+    ("access_logs", "scanned_by", "users(id)", "fk_al_user"),
+]
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        for col, dtype in [("assigned_vehicle", "VARCHAR(100) DEFAULT '---'"),
-                           ("assigned_since", "VARCHAR(50) DEFAULT '---'")]:
+        for tbl, col, ref, name in _FK_MIGRATIONS:
             try:
-                await conn.execute(text(f"ALTER TABLE devices ADD COLUMN {col} {dtype}"))
+                await conn.execute(text(
+                    f"ALTER TABLE {tbl} ADD CONSTRAINT {name} FOREIGN KEY ({col}) REFERENCES {ref}"
+                ))
             except Exception:
                 pass
-        try:
-            await conn.execute(text("ALTER TABLE entry_exit ADD COLUMN image_b64 TEXT"))
-        except Exception:
-            pass
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
